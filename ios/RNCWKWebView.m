@@ -32,12 +32,15 @@ static NSString *const MessageHanderName = @"ReactNative";
 @property (nonatomic, copy) RCTDirectEventBlock onShouldStartLoadWithRequest;
 @property (nonatomic, copy) RCTDirectEventBlock onMessage;
 @property (nonatomic, copy) WKWebView *webView;
+@property (nonatomic, strong) WKUserScript *atStartScript;
+@property (nonatomic, strong) WKUserScript *atEndScript;
 @end
 
 @implementation RNCWKWebView
 {
   UIColor * _savedBackgroundColor;
   BOOL _savedHideKeyboardAccessoryView;
+  BOOL _injectedJavaScriptForMainFrameOnly;
 }
 
 - (void)dealloc{}
@@ -69,6 +72,7 @@ static NSString *const MessageHanderName = @"ReactNative";
     _scrollEnabled = YES;
     _automaticallyAdjustContentInsets = YES;
     _contentInset = UIEdgeInsetsZero;
+    _injectedJavaScriptForMainFrameOnly = NO;
   }
 
   // Workaround for a keyboard dismissal bug present in iOS 12
@@ -443,40 +447,8 @@ static NSString *const MessageHanderName = @"ReactNative";
 - (void)      webView:(WKWebView *)webView
   didFinishNavigation:(WKNavigation *)navigation
 {
-  if (_messagingEnabled) {
-    #if RCT_DEV
-
-    // Implementation inspired by Lodash.isNative.
-    NSString *isPostMessageNative = @"String(String(window.postMessage) === String(Object.hasOwnProperty).replace('hasOwnProperty', 'postMessage'))";
-    [self evaluateJS: isPostMessageNative thenCall: ^(NSString *result) {
-      if (! [result isEqualToString:@"true"]) {
-        RCTLogError(@"Setting onMessage on a WebView overrides existing values of window.postMessage, but a previous value was defined");
-      }
-    }];
-    #endif
-
-    NSString *source = [NSString stringWithFormat:
-      @"(function() {"
-        "window.originalPostMessage = window.postMessage;"
-
-        "window.postMessage = function(data) {"
-          "window.webkit.messageHandlers.%@.postMessage(String(data));"
-        "};"
-      "})();",
-      MessageHanderName
-    ];
-    [self evaluateJS: source thenCall: nil];
-  }
-
-  if (_injectedJavaScript) {
-    [self evaluateJS: _injectedJavaScript thenCall: ^(NSString *jsEvaluationValue) {
-      NSMutableDictionary *event = [self baseEvent];
-      event[@"jsEvaluationValue"] = jsEvaluationValue;
-      if (self.onLoadingFinish) {
-        self.onLoadingFinish(event);
-      }
-    }];
-  } else if (_onLoadingFinish) {
+  // we only need the final 'finishLoad' call so only fire the event when we're actually done loading.
+  if (_onLoadingFinish && !webView.loading && ![webView.URL.absoluteString isEqualToString:@"about:blank"]) {
     _onLoadingFinish([self baseEvent]);
   }
 
@@ -485,8 +457,63 @@ static NSString *const MessageHanderName = @"ReactNative";
 
 - (void)injectJavaScript:(NSString *)script
 {
-  [self evaluateJS: script thenCall: nil];
+  _injectedJavaScript = script;
+  self.atEndScript = [[WKUserScript alloc] initWithSource:script
+                                            injectionTime:WKUserScriptInjectionTimeAtDocumentEnd
+                                         forMainFrameOnly:_injectedJavaScriptForMainFrameOnly];
+  [self resetupScripts];
 }
+
+- (void)setInitialJavaScript:(NSString *)initialJavaScript {
+  _initialJavaScript = initialJavaScript;
+  self.atStartScript = [[WKUserScript alloc] initWithSource:initialJavaScript
+                                              injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                                           forMainFrameOnly:_injectedJavaScriptForMainFrameOnly];
+  [self resetupScripts];
+}
+
+- (void)resetupScripts {
+  [_webView.configuration.userContentController removeAllUserScripts];
+  [self setupPostMessageScript];
+  if (self.atStartScript) {
+    [_webView.configuration.userContentController addUserScript:self.atStartScript];
+  }
+  if (self.atEndScript) {
+    [_webView.configuration.userContentController addUserScript:self.atEndScript];
+  }
+}
+
+- (void)setupPostMessageScript {
+  
+  if (_messagingEnabled) {
+#if RCT_DEV
+    
+    // Implementation inspired by Lodash.isNative.
+    NSString *isPostMessageNative = @"String(String(window.postMessage) === String(Object.hasOwnProperty).replace('hasOwnProperty', 'postMessage'))";
+    [self evaluateJS: isPostMessageNative thenCall: ^(NSString *result) {
+      if (! [result isEqualToString:@"true"]) {
+        RCTLogError(@"Setting onMessage on a WebView overrides existing values of window.postMessage, but a previous value was defined");
+      }
+    }];
+#endif
+    
+    NSString *source = [NSString stringWithFormat:
+                        @"(function() {"
+                        "window.originalPostMessage = window.postMessage;"
+                        
+                        "window.postMessage = function(data) {"
+                        "window.webkit.messageHandlers.%@.postMessage(String(data));"
+                        "};"
+                        "})();",
+                        MessageHanderName
+                        ];
+    WKUserScript *script = [[WKUserScript alloc] initWithSource:source
+                                                  injectionTime:WKUserScriptInjectionTimeAtDocumentEnd
+                                               forMainFrameOnly:_injectedJavaScriptForMainFrameOnly];
+    [_webView.configuration.userContentController addUserScript:script];
+  }
+}
+
 
 - (void)goForward
 {
